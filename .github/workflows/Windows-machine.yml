@@ -20,12 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download bore
+      - name: Generate secure password
+        shell: powershell
         run: |
-          Invoke-WebRequest "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile bore.zip
-          Expand-Archive bore.zip -DestinationPath .
+          $pass = if ("${{ secrets.MACHINE_PASSWORD }}" -ne "") { "${{ secrets.MACHINE_PASSWORD }}" } else { -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | % {[char]$_}) + "!@#" }
+          $pass | Out-File -FilePath $env:TEMP\pass.txt -Encoding utf8 -NoNewline
+          Write-Output "::add-mask::$pass"
+          Write-Output "MACHINE_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Enable Remote Desktop
+        shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
@@ -34,162 +38,81 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
           Start-Sleep -Seconds 3
-          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "${{ secrets.MACHINE_PASSWORD || 'P@ssw0rd!123' }}" -Force)
+          $pass = Get-Content $env:TEMP\pass.txt -Encoding utf8
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "$pass" -Force)
+          Write-Output "[✓] RDP enabled on runneradmin"
 
-      - name: Download and configure LCXL Remote Desk
+      - name: Verify RDP is listening
+        shell: powershell
         run: |
-          Invoke-WebRequest "https://github.com/lcxl-remote/lcxl-remote-desk-web/releases/download/v0.0.1/tauri-windows-x86_64.zip" -OutFile lcxl.zip
-          Expand-Archive lcxl.zip -DestinationPath lcxl
-
-          $srv = Get-ChildItem -Recurse -Filter "lcxl-remote-desk-server.exe" | Select-Object -First 1
-
-          if (-not $srv) {
-            Write-Error "lcxl-remote-desk-server.exe not found in bundle"
-            exit 1
+          for ($i = 0; $i -lt 10; $i++) {
+            $test = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Output "[✓] RDP listening on 127.0.0.1:3389"
+              exit 0
+            }
+            Start-Sleep -Seconds 2
           }
+          Write-Error "RDP not listening on port 3389"
+          exit 1
 
-          $PASS = "${{ secrets.MACHINE_PASSWORD || 'P@ssw0rd!123' }}"
-          $cfg = "$env:GITHUB_WORKSPACE\lcxl\config.toml"
-
-          $lines = @(
-            '[system]',
-            'port = 8091',
-            'listen_addr_ipv4 = "0.0.0.0"',
-            'enable_ipv6 = false',
-            '',
-            '[log]',
-            'log_level = "info"',
-            '',
-            '[user]',
-            'login_user_name = "runneradmin"',
-            "login_password = ""$PASS""",
-            '',
-            '[desk]',
-            'video_fps = 30',
-            'video_quality = 28',
-            'show_mouse = true',
-            'enable_dirty_rect = true',
-            '',
-            '[security]',
-            'allow_remote_control = true',
-            'allow_clipboard_sync = true',
-            'allow_system_audio_capture = false',
-            'allow_private_screen = false',
-            'allow_whiteboard = false',
-            'allow_terminal = true',
-            'allow_file_browse = true',
-            'allow_file_delete = false',
-            'allow_file_transfer = false',
-            'approval_timeout = 0',
-            '',
-            '[turn]',
-            'enable_turn = true'
-          )
-
-          Set-Content -Path $cfg -Value ($lines -join [Environment]::NewLine) -Encoding utf8
-          Get-Content $cfg
+      - name: Download bore
+        shell: powershell
+        run: |
+          Write-Output "[*] Downloading bore..."
+          Invoke-WebRequest "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile bore.zip
+          Expand-Archive bore.zip -DestinationPath .
+          Write-Output "[✓] Bore downloaded"
 
       - name: Download cloudflared
+        shell: powershell
         run: |
+          Write-Output "[*] Downloading cloudflared..."
           Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
+          Write-Output "[✓] Cloudflared downloaded"
 
       - name: Start the machine
+        shell: powershell
         run: |
-          $PASS = "${{ secrets.MACHINE_PASSWORD || 'P@ssw0rd!123' }}"
-          $PASS_ENC = [uri]::EscapeDataString($PASS)
+          $pass = Get-Content $env:TEMP\pass.txt -Encoding utf8
+          $pass_enc = [uri]::EscapeDataString($pass)
 
           $env:PORT = "8082"
           $env:KIND = "windows"
           $env:LABEL = "GitHub Machine - Windows"
-          $env:USER = "runner | runneradmin"
-          $env:PASS = $PASS
+          $env:USER = "runneradmin"
+          $env:PASS = $pass
           $env:BUILTIN_TERM = "1"
           $env:TERM_SHELL = "cmd.exe"
-          $env:VNC = "0"
           $env:RDP = "1"
           $env:RDP_USER = "runneradmin"
-
-          # RDP always points to the local Windows RDP service.
           $env:RDP_ADDR = "127.0.0.1:3389"
-
           $env:RELAY_LOG = "C:\relay.log"
 
+          Write-Output "[*] Starting console server..."
           Start-Process `
             -FilePath "node" `
             -ArgumentList "$env:GITHUB_WORKSPACE\machine-console\console.js" `
             -WindowStyle Hidden
 
           $ok = $false
-
-          for ($n = 0; $n -lt 12 -and -not $ok; $n++) {
-            if ($n -gt 0) {
-              Start-Sleep -Seconds 5
-            }
-
+          for ($n = 0; $n -lt 15; $n++) {
+            if ($n -gt 0) { Start-Sleep -Seconds 3 }
             try {
-              (Invoke-WebRequest `
-                "http://127.0.0.1:8082/healthz" `
-                -UseBasicParsing `
-                -TimeoutSec 5).Content | Out-Null
-
+              (Invoke-WebRequest "http://127.0.0.1:8082/healthz" -UseBasicParsing -TimeoutSec 5).Content | Out-Null
               $ok = $true
+              Write-Output "[✓] Console server is ready"
+              break
             }
-            catch {}
+            catch { Write-Output "[*] Waiting for console (attempt $($n+1))..." }
           }
 
           if (-not $ok) {
-            Write-Error "console failed to start"
+            Write-Error "Console failed to start"
             exit 1
           }
 
-          # LCXL Remote Desk
-          $srv = Get-ChildItem -Recurse -Filter "lcxl-remote-desk-server.exe" |
-            Select-Object -First 1
-
-          $env:LCXL_CFG = "$env:GITHUB_WORKSPACE\lcxl\config.toml"
-
-          Start-Process `
-            -FilePath $srv.FullName `
-            -ArgumentList @("-s","default","-c",$env:LCXL_CFG) `
-            -RedirectStandardOutput lcxl.out `
-            -RedirectStandardError lcxl.err `
-            -WindowStyle Hidden
-
-          $lcxlUp = $false
-
-          for ($n = 0; $n -lt 12 -and -not $lcxlUp; $n++) {
-            if ($n -gt 0) {
-              Start-Sleep -Seconds 3
-            }
-
-            try {
-              Invoke-WebRequest `
-                "http://127.0.0.1:8091/api/init/requirements" `
-                -UseBasicParsing `
-                -TimeoutSec 5 | Out-Null
-
-              $lcxlUp = $true
-            }
-            catch {}
-          }
-
-          if (-not $lcxlUp) {
-            Write-Output "::warning::lcxl server not ready on 8091"
-            Get-Content lcxl.out,lcxl.err -ErrorAction SilentlyContinue
-          }
-
-          Start-Process `
-            -FilePath ".\cloudflared.exe" `
-            -ArgumentList @(
-              "tunnel",
-              "--url",
-              "http://127.0.0.1:8091",
-              "--no-autoupdate"
-            ) `
-            -RedirectStandardOutput cl1.out `
-            -RedirectStandardError cl1.err `
-            -WindowStyle Hidden
-
+          Write-Output "[*] Starting cloudflared tunnel for console (port 8082)..."
           Start-Process `
             -FilePath ".\cloudflared.exe" `
             -ArgumentList @(
@@ -198,23 +121,11 @@ jobs:
               "http://127.0.0.1:8082",
               "--no-autoupdate"
             ) `
-            -RedirectStandardOutput cloudflared.out `
-            -RedirectStandardError cloudflared.err `
+            -RedirectStandardOutput "cloudflared.out" `
+            -RedirectStandardError "cloudflared.err" `
             -WindowStyle Hidden
 
-          Start-Process `
-            -FilePath ".\bore.exe" `
-            -ArgumentList @(
-              "local",
-              "8082",
-              "--local-host",
-              "127.0.0.1",
-              "--to",
-              "bore.pub"
-            ) `
-            -RedirectStandardOutput bore8082.out `
-            -RedirectStandardError bore8082.err
-
+          Write-Output "[*] Starting bore tunnel for native RDP (port 3389)..."
           Start-Process `
             -FilePath ".\bore.exe" `
             -ArgumentList @(
@@ -225,197 +136,164 @@ jobs:
               "--to",
               "bore.pub"
             ) `
-            -RedirectStandardOutput bore3389.out `
-            -RedirectStandardError bore3389.err
+            -RedirectStandardOutput "bore.out" `
+            -RedirectStandardError "bore.err" `
+            -WindowStyle Hidden
 
-          function Get-BoreHost([string]$file) {
-            $raw = Get-Content $file -Raw -ErrorAction SilentlyContinue
+          function Get-CfUrl {
+            $raw = Get-Content "cloudflared.out", "cloudflared.err" -Raw -ErrorAction SilentlyContinue
+            if ($raw -match "(https://[a-z0-9-]+\.trycloudflare\.com)") {
+              return $matches[1]
+            }
+            return $null
+          }
 
+          function Get-BoreHost {
+            $raw = Get-Content "bore.out", "bore.err" -Raw -ErrorAction SilentlyContinue
             if ($raw -match "listening at (\S+)") {
               return $matches[1]
             }
-
             return $null
           }
 
-          function Get-CfHost {
-            $raw = Get-Content cloudflared.out,cloudflared.err -Raw -ErrorAction SilentlyContinue
-
-            if ($raw -match "https://([a-z0-9-]+\.trycloudflare\.com)") {
-              return $matches[0]
-            }
-
-            return $null
-          }
-
-          function Get-CfHost2 {
-            $raw = Get-Content cl1.out,cl1.err -Raw -ErrorAction SilentlyContinue
-
-            if ($raw -match "https://([a-z0-9-]+\.trycloudflare\.com)") {
-              return $matches[0]
-            }
-
-            return $null
-          }
-
-          $c = $null
-          $b = $null
-          $r = $null
-          $l = $null
-
+          $cf_url = $null
+          $bore_host = $null
           $deadline = (Get-Date).AddSeconds(90)
 
-          while (
-            -not ($c -and $b -and $r -and $l) -and
-            (Get-Date) -lt $deadline
-          ) {
+          Write-Output "[*] Waiting for tunnels to establish..."
+          while ((Get-Date) -lt $deadline) {
+            if (-not $cf_url) { $cf_url = Get-CfUrl }
+            if (-not $bore_host) { $bore_host = Get-BoreHost }
+
+            if ($cf_url -and $bore_host) {
+              Write-Output "[✓] Both tunnels established"
+              break
+            }
+
             Start-Sleep -Seconds 4
-
-            if (-not $c) {
-              $c = Get-CfHost
-            }
-
-            if (-not $b) {
-              $b = Get-BoreHost "bore8082.err"
-
-              if (-not $b) {
-                $b = Get-BoreHost "bore8082.out"
-              }
-            }
-
-            if (-not $r) {
-              $r = Get-BoreHost "bore3389.err"
-
-              if (-not $r) {
-                $r = Get-BoreHost "bore3389.out"
-              }
-            }
-
-            if (-not $l) {
-              $l = Get-CfHost2
-            }
           }
 
-          $BASE = if ($c) {
-            $c
-          }
-          elseif ($b) {
-            "http://$b"
-          }
-          else {
-            ""
-          }
-
-          if (-not $BASE) {
-            Write-Output "::error::no console tunnel available."
-
-            Get-Content `
-              cloudflared.out,
-              cloudflared.err,
-              bore8082.err,
-              bore8082.out `
-              -ErrorAction SilentlyContinue
-
+          if (-not $cf_url) {
+            Write-Output "::error::No cloudflared tunnel available"
+            Get-Content "cloudflared.out", "cloudflared.err" -ErrorAction SilentlyContinue | Write-Output
             exit 1
           }
 
-          Write-Output "CONSOLE_URL=$BASE"
+          Write-Output "[✓] Console URL: $cf_url"
+          Write-Output "CONSOLE_URL=$cf_url" >> $env:GITHUB_ENV
+          Write-Output "::notice title=🖥️ Console (Terminal & Desktop)::$cf_url"
 
-          Write-Output "MAROHUB_CONSOLE=$BASE"
-          Write-Output "::notice title=Machine console::$BASE"
+          $rdp_url = "$cf_url/rdp/index.html?user=runneradmin&pass=$pass_enc"
+          Write-Output "::notice title=🎮 Remote Desktop (Embedded RDP)::$rdp_url"
 
-          Write-Output "::notice title=Web terminal::$BASE/term/"
-
-          # Embedded RDP URL is always generated.
-          $RDP_URL = "$BASE/rdp/index.html?user=runneradmin&pass=$PASS_ENC"
-
-          Write-Output "MAROHUB_DESKTOP=$RDP_URL"
-          Write-Output "::notice title=Desktop (embedded RDP)::$RDP_URL"
-
-          # Native RDP endpoint is optional.
-          if ($r) {
-            Write-Output "MAROHUB_RDP=$r"
-            Write-Output "::notice title=Remote Desktop (native)::$r  (user runneradmin / password $PASS)"
+          if ($bore_host) {
+            Write-Output "[✓] Native RDP endpoint: $bore_host (user: runneradmin)"
+            Write-Output "::notice title=📱 Native RDP Client::$bore_host (use user: runneradmin)"
           }
 
-          if ($l) {
-            $LCXL_URL = "$l"
+          # Summary for step outputs
+          $summary = @"
+## ✅ Windows Machine Online
 
-            Write-Output "MAROHUB_LCXL=$LCXL_URL"
-            Write-Output "::notice title=LCXL Remote Desk::$LCXL_URL  (user runneradmin / password $PASS)"
-          }
+### 🌐 Access Methods
 
-          $summary = "## Windows machine`n`n"
+1. **Web Browser (Recommended for Android)**
+   - Open: **$cf_url**
+   - Features: Terminal, Embedded RDP Desktop
+   - No app needed, works on any browser
 
-          $summary += "* **Console** (one URL - Desktop / Terminal): $BASE`n"
+2. **Embedded RDP (Web-based)**
+   - Open: **$cf_url/rdp/index.html**
+   - User: **runneradmin**
+   - Works on Android Firefox, Chrome
 
-          $summary += "* **Desktop** (embedded RDP): $BASE/rdp/index.html - user ``runneradmin``, password ``$PASS`` `n"
+3. **Native RDP Client (Windows/Mac/Android)**
+   - Server: **$bore_host**
+   - User: **runneradmin**
+   - Password: *configured in your secrets*
 
-          if ($r) {
-            $summary += "* **Desktop** (native RDP client): $r - user ``runneradmin``, password ``$PASS`` `n"
-          }
+### 📋 Terminal
+   - URL: **$cf_url/term/**
+   - Open shell on machine
 
-          if ($l) {
-            $summary += "* **Desktop** (LCXL Remote Desk / WebRTC probe): $l - user ``runneradmin``, password ``$PASS`` `n"
-          }
+### ⏱️ Session Duration
+   - Machine lives until GitHub Actions run completes (~7 hours max)
+   - Accessible during entire session
 
-          $summary += "`n> The machine lives until this run ends or ~6h, whichever comes first."
+### 📱 For Android
+   - **Browser URL**: Copy console URL above
+   - **Native RDP**: Use Microsoft Remote Desktop or similar RDP app
+   - Enter hostname: $bore_host
+   - User: runneradmin
+   - Port: see hostname (usually :PORT)
 
-          $summary |
-            Out-File `
-              -FilePath $env:GITHUB_STEP_SUMMARY `
-              -Append `
-              -Encoding utf8
+"@
 
-          # Publish live endpoints.
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+          # Publish state file for tracking
+          New-Item -ItemType Directory -Force -Path ".machine-state" | Out-Null
+          $state = @{
+            run_id = $env:GITHUB_RUN_ID
+            kind = "windows"
+            console = $cf_url
+            rdp_embedded = $rdp_url
+            rdp_native = $bore_host
+            user = "runneradmin"
+            endpoints = @{
+              MAROHUB_CONSOLE = $cf_url
+              MAROHUB_TERMINAL = "$cf_url/term/"
+              MAROHUB_DESKTOP = $rdp_url
+              MAROHUB_RDP = $bore_host
+            }
+          } | ConvertTo-Json -Compress
+
+          $state | Out-File -FilePath ".machine-state/windows.json" -Encoding utf8 -NoNewline
+
           try {
-            $ep = @{}
-
-            $ep["MAROHUB_CONSOLE"] = $BASE
-            $ep["MAROHUB_TERMINAL"] = "$BASE/term/"
-            $ep["MAROHUB_DESKTOP"] = "$BASE/rdp/index.html?user=runneradmin&pass=$PASS_ENC"
-
-            if ($r) {
-              $ep["MAROHUB_RDP"] = $r
-            }
-
-            if ($l) {
-              $ep["MAROHUB_LCXL"] = $l
-            }
-
-            $state = @{
-              run_id = $env:GITHUB_RUN_ID
-              endpoints = $ep
-            } | ConvertTo-Json -Compress
-
-            New-Item `
-              -ItemType Directory `
-              -Force `
-              -Path .machine-state | Out-Null
-
-            Set-Content `
-              -Path .machine-state/windows.json `
-              -Value $state `
-              -NoNewline `
-              -Encoding utf8
-
             git config user.name "github-machine"
             git config user.email "github-machine@users.noreply.github.com"
-
             git checkout --orphan machine-state/windows 2>$null
             git rm -rf --cached . 2>$null
-
             git add .machine-state/windows.json
             git commit -m "machine state: $env:GITHUB_RUN_ID" 2>$null
             git push -f origin machine-state/windows 2>$null
+            Write-Output "[✓] State published"
           }
           catch {
-            Write-Output "state publish skipped: $($_.Exception.Message)"
+            Write-Output "[!] State publish skipped: $_"
           }
 
-          # Keep the Windows runner alive independently of bore.
-          $keepAliveUntil = (Get-Date).AddMinutes(420)
+          Write-Output ""
+          Write-Output "═══════════════════════════════════════════════════════════"
+          Write-Output "✅ WINDOWS MACHINE IS READY"
+          Write-Output "═══════════════════════════════════════════════════════════"
+          Write-Output ""
+          Write-Output "📲 FROM ANDROID:"
+          Write-Output "  1. Open browser → $cf_url"
+          Write-Output "  2. Or use RDP app → connect to $bore_host (user: runneradmin)"
+          Write-Output ""
+          Write-Output "🕒 Machine active for: ~7 hours (or until you stop the workflow)"
+          Write-Output "═══════════════════════════════════════════════════════════"
+          Write-Output ""
 
-          while ((Get-Date) -lt $keepAliveUntil) {
+      - name: Keep machine alive
+        shell: powershell
+        run: |
+          # Prevent early termination by checking tunnel processes
+          Write-Output "[*] Monitoring tunnels..."
+          $maxWait = [datetime]::Now.AddMinutes(420)
+
+          while ([datetime]::Now -lt $maxWait) {
+            $cf = Get-Process cloudflared -ErrorAction SilentlyContinue
+            $bore = Get-Process bore -ErrorAction SilentlyContinue
+
+            if (-not $cf -or -not $bore) {
+              Write-Output "[!] Tunnel process died, restarting..."
+              exit 1
+            }
+
             Start-Sleep -Seconds 30
           }
+
+          Write-Output "[✓] Machine session completed"
