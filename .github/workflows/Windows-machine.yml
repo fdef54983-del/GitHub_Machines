@@ -1,0 +1,184 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [machine-windows]
+
+concurrency:
+  group: windows-machine
+  cancel-in-progress: false
+
+jobs:
+  machine:
+    runs-on: windows-latest
+    timeout-minutes: 435
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate secure password
+        shell: powershell
+        run: |
+          $pass = if ("${{ secrets.MACHINE_PASSWORD }}" -ne "") { "${{ secrets.MACHINE_PASSWORD }}" } else { -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | % {[char]$_}) + "!@#"}
+          $pass | Out-File -FilePath $env:TEMP\pass.txt -Encoding utf8 -NoNewline
+          Write-Output "::add-mask::$pass"
+          "MACHINE_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 3
+          $pass = Get-Content $env:TEMP\pass.txt -Encoding utf8
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "$pass" -Force)
+          Write-Output "[✓] RDP enabled on runneradmin"
+
+      - name: Verify RDP is listening
+        shell: powershell
+        run: |
+          for ($i = 0; $i -lt 10; $i++) {
+            $test = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Output "[✓] RDP listening on 127.0.0.1:3389"
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+          }
+          Write-Error "RDP not listening on port 3389"
+          exit 1
+
+      - name: Download bore
+        shell: powershell
+        run: |
+          Invoke-WebRequest "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile bore.zip
+          Expand-Archive bore.zip -DestinationPath .
+
+      - name: Download cloudflared
+        shell: powershell
+        run: |
+          Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
+
+      - name: Start the machine
+        shell: powershell
+        run: |
+          $pass = Get-Content $env:TEMP\pass.txt -Encoding utf8
+          $pass_enc = [uri]::EscapeDataString($pass)
+
+          $env:PORT = "8082"
+          $env:KIND = "windows"
+          $env:LABEL = "GitHub Machine - Windows"
+          $env:USER = "runneradmin"
+          $env:PASS = $pass
+          $env:BUILTIN_TERM = "1"
+          $env:TERM_SHELL = "cmd.exe"
+          $env:RDP = "1"
+          $env:RDP_USER = "runneradmin"
+          $env:RDP_ADDR = "127.0.0.1:3389"
+          $env:RELAY_LOG = "C:\relay.log"
+
+          Start-Process -FilePath "node" -ArgumentList "$env:GITHUB_WORKSPACE\machine-console\console.js" -WindowStyle Hidden
+
+          $ok = $false
+          for ($n = 0; $n -lt 15; $n++) {
+            if ($n -gt 0) { Start-Sleep -Seconds 3 }
+            try {
+              (Invoke-WebRequest "http://127.0.0.1:8082/healthz" -UseBasicParsing -TimeoutSec 5).Content | Out-Null
+              $ok = $true
+              break
+            } catch {}
+          }
+          if (-not $ok) {
+            Write-Error "Console failed to start"
+            exit 1
+          }
+
+          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList @("tunnel","--url","http://127.0.0.1:8082","--no-autoupdate") -RedirectStandardOutput "cloudflared.out" -RedirectStandardError "cloudflared.err" -WindowStyle Hidden
+          Start-Process -FilePath ".\bore.exe" -ArgumentList @("local","3389","--local-host","127.0.0.1","--to","bore.pub") -RedirectStandardOutput "bore.out" -RedirectStandardError "bore.err" -WindowStyle Hidden
+
+          function Get-CfUrl {
+            $raw = Get-Content "cloudflared.out","cloudflared.err" -Raw -ErrorAction SilentlyContinue
+            if ($raw -match "(https://[a-z0-9-]+\.trycloudflare\.com)") { return $matches[1] }
+            return $null
+          }
+
+          function Get-BoreHost {
+            $raw = Get-Content "bore.out","bore.err" -Raw -ErrorAction SilentlyContinue
+            if ($raw -match "listening at (\S+)") { return $matches[1] }
+            return $null
+          }
+
+          $cf_url = $null
+          $bore_host = $null
+          $deadline = (Get-Date).AddSeconds(90)
+
+          while ((Get-Date) -lt $deadline) {
+            if (-not $cf_url) { $cf_url = Get-CfUrl }
+            if (-not $bore_host) { $bore_host = Get-BoreHost }
+            if ($cf_url -and $bore_host) { break }
+            Start-Sleep -Seconds 4
+          }
+
+          if (-not $cf_url) {
+            Write-Output "::error::No cloudflared tunnel available"
+            Get-Content "cloudflared.out","cloudflared.err" -ErrorAction SilentlyContinue | Write-Output
+            exit 1
+          }
+
+          Write-Output "CONSOLE_URL=$cf_url"
+          Write-Output "::notice title=🖥️ Console::$cf_url"
+          $rdp_url = "$cf_url/rdp/index.html?user=runneradmin&pass=$pass_enc"
+          Write-Output "::notice title=🎮 Embedded RDP::$rdp_url"
+
+          if ($bore_host) {
+            Write-Output "::notice title=📱 Native RDP::$bore_host (user: runneradmin)"
+          }
+
+          $summary = @"
+## ✅ Windows Machine Online
+
+### 🌐 Access Methods
+1. **Web Browser (Recommended for Android)**
+   - Open: **$cf_url**
+   - Features: Terminal, Embedded RDP Desktop
+
+2. **Embedded RDP (Web-based)**
+   - Open: **$cf_url/rdp/index.html**
+   - User: **runneradmin**
+   - Password: **$pass**
+
+3. **Native RDP Client**
+   - Server: **$bore_host**
+   - User: **runneradmin**
+   - Password: **$pass**
+
+### 📱 For Android
+- Open browser: **$cf_url**
+- Or use RDP app: connect to **$bore_host**
+- User: **runneradmin**
+- Password: **$pass**
+"@
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Keep machine alive
+        shell: powershell
+        run: |
+          $maxWait = [datetime]::Now.AddMinutes(420)
+          while ([datetime]::Now -lt $maxWait) {
+            $cf = Get-Process cloudflared -ErrorAction SilentlyContinue
+            $bore = Get-Process bore -ErrorAction SilentlyContinue
+            if (-not $cf -or -not $bore) {
+              Write-Output "[!] Tunnel process died, restarting..."
+              exit 1
+            }
+            Start-Sleep -Seconds 30
+          }
